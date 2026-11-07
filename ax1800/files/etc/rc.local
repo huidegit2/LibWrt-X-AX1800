@@ -1,0 +1,14 @@
+#!/bin/sh
+# AX1800 Pro 开机补充脚本。
+
+# 包源地址自愈：LibWrt 的 default-settings-chn 首启会把源改到
+#    https://mirrors.vsean.net/openwrt，这个域名现在只回一个跟不过去的 302，
+#    apk 拿不到 packages.adb（wget error 8 / unexpected end of file），
+#    整个事务就被记成 1 个 error。只在发现这个死源时改回官方源。
+FEEDS=/etc/apk/repositories.d/distfeeds.list
+if [ -f "$FEEDS" ] && grep -q 'mirrors\.vsean\.net' "$FEEDS"; then
+	sed -i 's,https://mirrors\.vsean\.net/openwrt,https://downloads.immortalwrt.org,g' "$FEEDS"
+	command -v logger >/dev/null 2>&1 && logger -t ax1800 "包源已从失效的 mirrors.vsean.net 改回 downloads.immortalwrt.org"
+fi
+
+exit 0

@@ -1,0 +1,386 @@
+name: Build AX1800 12M
+
+# 本仓库就是 LibWrt 25.12-nss 源码树（fork），构建时直接编当前 commit。
+# 配置全部在 ax1800/ 下，根目录的 .github 与 ax1800/ 不参与 OpenWrt 构建。
+#
+# 自动发布：编译 + 校验通过后直接发 Release（含自动生成的更新说明）。
+# 上游同步由 sync-upstream.yml 负责，它合并完会调用本 workflow。
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_size:
+        description: '内核分区大小：12288=12M（本机），6144=原厂6M'
+        type: choice
+        options:
+          - '12288'
+          - '6144'
+        default: '12288'
+  push:
+    branches: [25.12-nss]
+    paths:
+      - 'ax1800/**'
+      - '.github/workflows/build.yml'
+
+concurrency:
+  group: build-ax1800
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - name: 腾磁盘
+        # 不用 easimon/maximize-build-space：它要重做 LVM，实测把根分区缩到装不下
+        # apt 索引（Write error 28: No space left on device）。runner 原始 / 有 80G+ 可用，
+        # 删掉镜像里用不到的 SDK 就够了。
+        run: |
+          set -eu
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc                       /usr/local/share/boost /usr/local/.ghcup /opt/az 2>/dev/null || true
+          sudo apt-get clean
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          echo "根分区可用: ${avail}G"
+          [ "$avail" -ge 25 ] || { echo "::error::根分区只剩 ${avail}G，OpenWrt 至少需要 25G"; exit 1; }
+
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -qq
+          sudo -E apt-get -y install --no-install-recommends \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext \
+            gcc-multilib g++-multilib genisoimage git gperf haveged help2man intltool libc6-dev-i386 \
+            libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev \
+            libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool \
+            lrzsz msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \
+            qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip \
+            vim wget xmlto xxd zlib1g-dev python3-setuptools
+
+      - name: 更新 feeds（上游 + 官方 iStore 源）
+        run: |
+          set -eu
+          # iStore 用官方源 linkease/istore（不是 kiddin9 的镜像）：只装四个包。
+          # 官方那份 luci-app-store 没有 @(x86_64||aarch64) 架构限制，
+          # 而 kiddin9 的副本有，且在本树上它的 Kconfig 符号完全没出现（run 41569582487）。
+          cp feeds.conf.default feeds.conf
+          # PassWall：应用本体在 openwrt-passwall，它的 C 依赖（chinadns-ng / dns2socks /
+          # microsocks / tcping / lyaml）在 openwrt-passwall-packages。两个都加，交给下面的 -a 处理。
+          echo 'src-git passwall https://github.com/Openwrt-Passwall/openwrt-passwall.git' >> feeds.conf
+          echo 'src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git' >> feeds.conf
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          # luci feed（immortalwrt）自带 luci-app-passwall 26.10.29，feeds install 会优先装它，
+          # passwall feed 那份被跳过；原来只认 passwall 路径，run 42329397051 就死在这。
+          test -f package/feeds/luci/luci-app-passwall/Makefile \
+            || test -f package/feeds/passwall/luci-app-passwall/Makefile \
+            || { echo "::error::luci-app-passwall 没装上（哪个 feed 里都没有）"; exit 1; }
+          echo "[+] luci-app-passwall 来自: $(ls -d package/feeds/*/luci-app-passwall)"
+
+          echo 'src-git istore https://github.com/linkease/istore.git' >> feeds.conf
+          ./scripts/feeds update -p istore
+          ./scripts/feeds install -p istore luci-app-store luci-lib-taskd taskd luci-lib-xterm
+
+          # 3) 主题用 jerrykuku 的 argon 3.x（feed 里是 2.4.7，且 3.x 已把设置页并进主题包）
+          ./scripts/feeds uninstall luci-theme-argon luci-app-argon-config || true
+          rm -rf package/luci-theme-argon package/luci-app-argon-config
+          git clone --depth 1 https://github.com/jerrykuku/luci-theme-argon package/luci-theme-argon
+          test -f package/luci-theme-argon/Makefile
+          grep -q 'PKG_VERSION:=3' package/luci-theme-argon/Makefile
+
+      - name: 生成 .config
+        env:
+          KS: ${{ inputs.kernel_size || '12288' }}
+        run: |
+          set -eu
+          cat ax1800/config/device.config >> .config
+          cat ax1800/config/repos.config >> .config
+          cat ax1800/config/packages.config >> .config
+          cat ax1800/config/packages-store.config >> .config
+          cat ax1800/config/kernel-dae.config >> .config
+          cat ax1800/config/apk-repo.config >> .config
+
+          # 12M：KERNEL_SIZE 默认 6144k，本机分区表是 12M
+          sh ax1800/scripts/set-kernel-size.sh "${KS:-12288}"
+
+          # 首启配置（WiFi / IPv6 / NAT1 / 时区 / LAN / root 密码）作为 rootfs 覆盖层
+          mkdir -p files
+          cp -Rf ax1800/files/. files/
+          # git 不保证保留可执行位，这里显式补上，否则 /etc/rc.local 不会被 /etc/init.d/done 执行
+          chmod +x files/etc/rc.local files/etc/uci-defaults/*
+          test -f files/etc/uci-defaults/99-ax1800
+          # apk 自建源：raw 直链，200 直出、不跳转（Releases 会 302 到 objects.githubusercontent.com，apk 不跟）
+          mkdir -p files/etc/apk/repositories.d
+          {
+            echo "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/apk-repo/target/packages.adb"
+            echo "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/apk-repo/kmods/packages.adb"
+          } > files/etc/apk/repositories.d/00-ax1800.list
+          cat files/etc/apk/repositories.d/00-ax1800.list
+
+          make defconfig
+          echo "===== 生效的关键项 ====="
+          grep -E '^CONFIG_(TARGET_qualcommax_ipq60xx_DEVICE_jdcloud_re-ss-01|PACKAGE_luci-theme-argon|PACKAGE_luci-app-store|PACKAGE_luci-app-usteer|PACKAGE_luci-app-autoreboot|PACKAGE_kmod-nft-fullcone|KERNEL_DEBUG_INFO_BTF|KERNEL_XDP_SOCKETS|VERSION_REPO)' .config || true
+          grep -q '^CONFIG_PACKAGE_luci-theme-argon=y$' .config \
+            || { echo "::error::argon 3.x 没被选中（可能和 feed 里的包名冲突）"; exit 1; }
+          for s in kmod-nft-socket kmod-netlink-diag kmod-ipt-nat; do
+            grep -q "^CONFIG_PACKAGE_$s=y$" .config \
+              || { echo "::error::$s 没被选中（PassWall 依赖它）"; exit 1; }
+          done
+          grep -q '^CONFIG_PACKAGE_luci-app-passwall=y$' .config \
+            || { echo "::error::luci-app-passwall 没被选中"; exit 1; }
+          nkm=$(grep -c '^CONFIG_PACKAGE_kmod-.*=m$' .config || true)
+          echo "ALL_KMODS 生效：$nkm 个 kmod 以 =m 参与编译"
+          [ "$nkm" -gt 800 ] || { echo "::error::ALL_KMODS 没生效（只看到 $nkm 个 kmod=m）"; exit 1; }
+          if ! grep -q '^CONFIG_PACKAGE_luci-app-store=y$' .config; then
+            echo "===== 诊断：iStore 为什么没被选中 ====="
+            echo '--- .config 里的 store/taskd ---'
+            grep -inE 'store|taskd|xterm' .config | head -10
+            echo '--- package/feeds/istore ---'
+            ls package/feeds/istore 2>/dev/null | grep -E 'store|taskd|xterm' || echo '(没有)'
+            echo '--- tmp/info 元数据 ---'
+            ls tmp/info 2>/dev/null | grep -iE 'store|taskd|xterm' || echo '(没有)'
+            echo '--- 架构符号 ---'
+            grep -E '^CONFIG_(aarch64|x86_64|ARCH_64BIT|arm)=' .config | head -5
+            echo '--- tmp/.config-package.in 里的 store ---'
+            grep -n -A8 'config PACKAGE_luci-app-store' tmp/.config-package.in 2>/dev/null | head -20 || echo '(没有)'
+            echo '--- 对照 luci-lib-taskd ---'
+            grep -n -A4 'config PACKAGE_luci-lib-taskd' tmp/.config-package.in 2>/dev/null | head -10 || echo '(没有)'
+            echo '--- 依赖版本 ---'
+            grep -hE 'PKG_VERSION|LUCI_EXTRA_DEPENDS' feeds/istore/luci/luci-app-store/Makefile feeds/istore/luci/luci-lib-taskd/Makefile 2>/dev/null
+            echo '::error::iStore 没被选中'
+            exit 1
+          fi
+
+      - name: 注入 root 密码
+        env:
+          RP: ${{ secrets.ROOT_PASSWORD }}
+        run: |
+          set -eu
+          python3 - "$RP" <<'PY'
+          import io, sys
+          pw = sys.argv[1].strip() or 'root'      # 没配 Secret 时默认 root
+          if '\n' in pw or '\r' in pw:
+              sys.exit('[x] ROOT_PASSWORD 含换行，passwd 会读错')
+          p = 'files/etc/uci-defaults/99-ax1800'
+          s = io.open(p, encoding='utf-8').read()
+          if '__ROOT_PASSWORD__' not in s:
+              sys.exit('[x] 99-ax1800 里找不到占位符 __ROOT_PASSWORD__')
+          io.open(p, 'w', encoding='utf-8').write(s.replace('__ROOT_PASSWORD__', pw))
+          PY
+          grep -q '__ROOT_PASSWORD__' files/etc/uci-defaults/99-ax1800 \
+            && { echo "::error::密码注入失败"; exit 1; } || true
+
+      - name: 写入 apk 签名密钥
+        env:
+          KEY: ${{ secrets.APK_SIGNING_KEY }}
+        run: |
+          set -eu
+          if [ -n "$KEY" ]; then
+            echo "$KEY" > private-key.pem
+            chmod 600 private-key.pem
+            openssl ec -in private-key.pem -pubout > public-key.pem
+            echo "[+] 使用 Secret APK_SIGNING_KEY 里的私钥签名"
+          else
+            echo "::warning::没配 APK_SIGNING_KEY，本次构建现生成密钥；以后重刷固件，旧镜像将不信任新的 apk-repo"
+          fi
+
+      - name: 缓存 staging_dir
+        uses: actions/cache@v4
+        with:
+          key: staging-${{ github.sha }}-${{ inputs.kernel_size || '12288' }}
+          restore-keys: |
+            staging-
+          path: staging_dir
+
+      - name: 刷新缓存时间戳
+        run: |
+          if [ -d staging_dir ]; then
+            find staging_dir -type d -name stamp -not -path '*target*' | while read -r d; do
+              find "$d" -type f -exec touch {} +
+            done
+          fi
+
+      - name: 预下载依赖
+        run: |
+          make download -j"$(nproc)" || make download -j1
+          # dl/ 里 <1KB 的文件是 404 页面留下的残骸，会让后面报 md5 不匹配
+          find dl -type f -size -1024c -delete
+
+      - name: 编译
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" || make -j1 || make -j1 V=s
+
+      - name: 校验产物
+        env:
+          KS: ${{ inputs.kernel_size || '12288' }}
+        run: |
+          set -eu
+          f=$(ls bin/targets/qualcommax/ipq60xx/*jdcloud_re-ss-01-squashfs-factory.bin | head -1)
+          echo "镜像: $f ($(stat -c%s "$f") 字节)"
+          magic=$(od -An -tx1 -N4 "$f" | tr -d ' \n')
+          [ "$magic" = "d00dfeed" ] || { echo "::error::不是 FIT 镜像（$magic）"; exit 1; }
+          fit=$(od -An -tu4 -j4 -N4 --endian=big "$f" | tr -d ' ')
+          lim=$((KS * 1024))
+          echo "内核 FIT: ${fit} 字节 / ${lim} 字节分区"
+          [ "$fit" -lt "$lim" ] || { echo "::error::内核超过 ${KS}k，会写穿 rootfs"; exit 1; }
+          sq=$(od -An -tx1 -j"$lim" -N4 "$f" | tr -d ' \n')
+          [ "$sq" = "68737173" ] || { echo "::error::${KS}k 处不是 hsqs（$sq），内核/rootfs 边界异常"; exit 1; }
+          echo "[+] 边界正确"
+
+          man=$(ls bin/targets/qualcommax/ipq60xx/*jdcloud_re-ss-01.manifest | head -1)
+          echo "manifest: $(wc -l < "$man") 个包"
+          for p in luci-theme-argon luci-app-store luci-app-openclash luci-app-usteer \
+                   luci-app-autoreboot luci-app-samba4 luci-app-diskman kmod-nft-fullcone \
+                   kmod-usb-storage kmod-fs-ntfs3; do
+            grep -q "^$p " "$man" || { echo "::error::固件里没有 $p"; exit 1; }
+          done
+          echo "[+] 关键包都在"
+
+      - name: 发布 apk 源到 apk-repo 分支
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          T=bin/targets/qualcommax/ipq60xx
+          # 全量 make 的产物全平铺在 $T/packages（rules.mk: PACKAGE_DIR ?= $(BIN_DIR)/packages）；
+          # kmods/<kver>/ 那种分层目录只有官方 buildbot（CONFIG_BUILDBOT）才生成，本地编译没有。
+          [ -d "$T/packages" ] || { echo "::error::$T/packages 不存在；$T 下实际有：$(ls -1 "$T" 2>/dev/null | tr '\n' ' ')"; exit 1; }
+
+          OUT=$(mktemp -d)
+          mkdir -p "$OUT/target" "$OUT/kmods"
+          # 只发官方源给不了的两类：kernel（带本机 config 哈希）和 kmod-*（依赖那个哈希）。
+          # 其余包继续走 distfeeds 里的官方源，免得 apk-repo 分支每次构建涨几百 MB。
+          for f in "$T"/packages/kmod-*.apk; do
+            [ -e "$f" ] || continue
+            cp -f "$f" "$OUT/kmods/"
+          done
+          for f in "$T"/packages/kernel-*.apk; do
+            [ -e "$f" ] || continue
+            cp -f "$f" "$OUT/target/"
+          done
+
+          nk=$(find "$OUT/kmods" -maxdepth 1 -name '*.apk' | wc -l)
+          nt=$(find "$OUT/target" -maxdepth 1 -name '*.apk' | wc -l)
+          echo "kmods: $nk 个，target: $nt 个"
+          [ "$nk" -gt 100 ] || { echo "::error::kmods 只有 $nk 个，明显不对"; exit 1; }
+          [ "$nt" -ge 1 ] || { echo "::error::没找到 kernel 包；kernel* 实际有：$(ls -1 "$T"/packages/kernel* 2>/dev/null | tr '\n' ' ')"; exit 1; }
+
+          APK=$PWD/staging_dir/host/bin/apk
+          [ -x "$APK" ] || { echo "::error::找不到 staging_dir/host/bin/apk"; exit 1; }
+          # 没签名 = 设备一律报 UNTRUSTED signature，源等于白做，直接失败
+          KEY=$PWD/private-key.pem
+          [ -f "$KEY" ] || { echo "::error::private-key.pem 不存在"; exit 1; }
+          cp -f public-key.pem "$OUT/" 2>/dev/null || openssl ec -in "$KEY" -pubout -out "$OUT/public-key.pem"
+          echo "[+] 公钥已随源一起发布（刷旧镜像时可直接下载补装）"
+
+          for d in target kmods; do
+            ( cd "$OUT/$d"
+              n=$(find . -maxdepth 1 -name '*.apk' | wc -l)
+              [ "$n" -gt 0 ] || { echo "::error::$d 目录没有 .apk"; exit 1; }
+              $APK mkndx --root . --keys-dir . --allow-untrusted --output packages.adb ./*.apk
+              before=$(stat -c%s packages.adb)
+              # apk 3.0.5 的 mkndx 根本没有 --sign（--sign 只是全局 --sign-key 的缩写，只加载密钥、不签名）。
+              # 签名要用 adbsign 把签名块写进 packages.adb 本身——apk v3 的索引没有 .sig 文件。
+              # --allow-untrusted 必带：adbsign 读入时也要过 adb 校验，未签名的索引会被判 UNTRUSTED。
+              $APK --sign-key "$KEY" --keys-dir "$OUT" --allow-untrusted adbsign --reset-signatures packages.adb
+              after=$(stat -c%s packages.adb)
+              # adbsign 出错也返回 0，只能靠体积变化判断
+              [ "$after" -gt "$before" ] || { echo "::error::$d 的索引没签上（$before -> $after 字节）"; exit 1; }
+              echo "[+] $d: $n 个包，$(du -sh . | cut -f1)，索引 $after 字节（签名 $(($after - $before)) 字节）"
+            )
+          done
+
+          $APK --allow-untrusted adbdump --format json "$OUT/target/packages.adb" > /tmp/idx-target.json 2>/dev/null || true
+          $APK --allow-untrusted adbdump --format json "$OUT/kmods/packages.adb"  > /tmp/idx-kmods.json  2>/dev/null || true
+          grep -qE '"name": *"kernel"' /tmp/idx-target.json || echo "::warning::target 索引里没找到 kernel 包名，检查一下格式"
+          grep -q 'kmod-mac80211' /tmp/idx-kmods.json || echo "::warning::kmods 索引里没找到 kmod-mac80211"
+
+          cd "$OUT"
+          git init -q
+          git checkout -q --orphan apk-repo
+          git add -A
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -q -m "apk-repo: kmod $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" apk-repo
+          echo "[+] 已发布到 apk-repo 分支（$(du -sh "$OUT" | cut -f1)）"
+
+      - name: 生成更新说明
+        id: notes
+        run: |
+          set -eu
+          prev=$(cat .upstream-state 2>/dev/null || echo "")
+          up=$(git ls-remote https://github.com/LiBwrt/LibWrt.git refs/heads/25.12-nss | awk '{print $1}')
+          echo "$up" > /tmp/upstream_sha
+          {
+            echo "## 上游更新"
+            if [ -n "$prev" ] && git cat-file -e "$prev" 2>/dev/null; then
+              git log --oneline "$prev"..HEAD -- target package include config toolchain scripts | head -40 \
+                | sed 's/^/- /' || true
+              [ "$(git log --oneline "$prev"..HEAD -- target package include config toolchain scripts | wc -l)" -gt 40 ] \
+                && echo "- ……（只列前 40 条）"
+            else
+              echo "- 首次构建，无对比基线"
+            fi
+            echo
+            echo "## 本次固件"
+            kver=$(grep -oP 'LINUX_KERNEL_HASH-\K[0-9.]+' target/linux/generic/kernel-6.12 2>/dev/null || echo unknown)
+            fit=$(od -An -tu4 -j4 -N4 --endian=big bin/targets/qualcommax/ipq60xx/*squashfs-factory.bin | tr -d ' ')
+            man=$(ls bin/targets/qualcommax/ipq60xx/*.manifest | head -1)
+            echo "- 内核 $kver，内核分区 ${KS:-12288}k，FIT ${fit} 字节，固件包 $(wc -l < "$man") 个"
+            echo "- 基于 commit \`$(git rev-parse --short HEAD)\`"
+            echo
+            echo "## apk 源"
+            echo "- 分支：https://github.com/${GITHUB_REPOSITORY}/tree/apk-repo"
+            echo "- 固件内置：https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/apk-repo/target/packages.adb"
+            echo "- 固件内置：https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/apk-repo/kmods/packages.adb"
+            echo
+            echo "## 刷写"
+            echo "- 12M 表：U-Boot \`/firmware.html\` 刷 \`*factory.bin\`"
+            echo "- 已在本固件上：LuCI 升级或用 \`sysupgrade *sysupgrade.bin\`"
+          } > /tmp/release-notes.md
+          cat /tmp/release-notes.md
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ax1800-${{ github.run_number }}
+          path: |
+            bin/targets/qualcommax/ipq60xx/*.bin
+            bin/targets/qualcommax/ipq60xx/*.manifest
+            bin/targets/qualcommax/ipq60xx/sha256sums
+          if-no-files-found: error
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KS: ${{ inputs.kernel_size || '12288' }}
+        run: |
+          set -eu
+          tag="ax1800-$(date +%Y%m%d)-${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" \
+            bin/targets/qualcommax/ipq60xx/*factory.bin \
+            bin/targets/qualcommax/ipq60xx/*sysupgrade.bin \
+            bin/targets/qualcommax/ipq60xx/*.manifest \
+            bin/targets/qualcommax/ipq60xx/sha256sums \
+            --title "$tag" --notes-file /tmp/release-notes.md
+
+      - name: 记录本次构建的上游版本
+        run: |
+          set -eu
+          cp /tmp/upstream_sha .upstream-state
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .upstream-state
+          git diff --cached --quiet || git commit -m "chore: 记录已构建的上游版本 $(cat .upstream-state | cut -c1-8)"
+          git push || true
